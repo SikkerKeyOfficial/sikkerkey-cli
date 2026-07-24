@@ -1,0 +1,26 @@
+{
+  "name": "sikkerkey",
+  "version": "3.0.7",
+  "description": "SikkerKey CLI — secrets management with machine authentication",
+  "keywords": ["secrets", "vault", "encryption", "cli", "sikkerkey"],
+  "homepage": "https://sikkerkey.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SikkerKeyOfficial/sikkerkey-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SikkerKeyOfficial/sikkerkey-cli/issues"
+  },
+  "license": "MIT",
+  "bin": {
+    "sikkerkey": "bin/sikkerkey"
+  },
+  "files": ["bin"],
+  "optionalDependencies": {
+    "@sikkerkey/cli-linux-x64": "3.0.7",
+    "@sikkerkey/cli-linux-arm64": "3.0.7",
+    "@sikkerkey/cli-darwin-x64": "3.0.7",
+    "@sikkerkey/cli-darwin-arm64": "3.0.7",
+    "@sikkerkey/cli-win32-x64": "3.0.7"
+  }
+}

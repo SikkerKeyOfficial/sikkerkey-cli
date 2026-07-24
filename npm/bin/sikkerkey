@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+
+const { execFileSync } = require('child_process');
+const path = require('path');
+const os = require('os');
+
+const platform = os.platform();
+const arch = os.arch();
+
+const platformKey = `${platform}-${arch}`;
+
+const packages = {
+  'linux-x64': '@sikkerkey/cli-linux-x64/sikkerkey',
+  'linux-arm64': '@sikkerkey/cli-linux-arm64/sikkerkey',
+  'darwin-x64': '@sikkerkey/cli-darwin-x64/sikkerkey',
+  'darwin-arm64': '@sikkerkey/cli-darwin-arm64/sikkerkey',
+  'win32-x64': '@sikkerkey/cli-win32-x64/sikkerkey.exe',
+};
+
+const binaryPath = packages[platformKey];
+
+if (!binaryPath) {
+  console.error(`Unsupported platform: ${platformKey}`);
+  console.error(`Supported: ${Object.keys(packages).join(', ')}`);
+  process.exit(1);
+}
+
+let resolved;
+try {
+  resolved = require.resolve(binaryPath);
+} catch {
+  console.error(`Could not find SikkerKey binary for ${platformKey}`);
+  console.error(`Try reinstalling: npm install -g sikkerkey`);
+  process.exit(1);
+}
+
+try {
+  execFileSync(resolved, process.argv.slice(2), { stdio: 'inherit' });
+} catch (e) {
+  process.exit(e.status ?? 1);
+}

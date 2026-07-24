@@ -1,0 +1,69 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC trusted publishing; no npm token anywhere
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
+
+      - name: Resolve and verify version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DECLARED=$(node -p "require('./npm/package.json').version")
+          if [ "$VERSION" != "$DECLARED" ]; then
+            echo "Tag $GITHUB_REF_NAME implies $VERSION but npm/package.json declares $DECLARED." >&2
+            echo "Bump the package.json files before tagging." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build platform binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o npm/linux-x64/sikkerkey     main.go
+          GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o npm/linux-arm64/sikkerkey   main.go
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o npm/darwin-x64/sikkerkey    main.go
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o npm/darwin-arm64/sikkerkey  main.go
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o npm/win32-x64/sikkerkey.exe main.go
+
+      - name: Verify tarballs carry the binaries
+        run: |
+          # The binaries are gitignored, so a stray ignore rule reaching into a
+          # package root would produce an empty tarball that only fails once a
+          # customer installs it. Assert the payload here instead.
+          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            (cd "npm/$platform" && npm pack --dry-run --json | grep -q '"path": *"sikkerkey"') \
+              || { echo "@sikkerkey/cli-$platform tarball is missing the binary" >&2; exit 1; }
+          done
+          (cd npm/win32-x64 && npm pack --dry-run --json | grep -q '"path": *"sikkerkey.exe"') \
+            || { echo "@sikkerkey/cli-win32-x64 tarball is missing the binary" >&2; exit 1; }
+          (cd npm && npm pack --dry-run --json | grep -q '"path": *"bin/sikkerkey"') \
+            || { echo "sikkerkey wrapper tarball is missing bin/sikkerkey" >&2; exit 1; }
+
+      - name: Publish platform packages
+        run: |
+          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            echo "Publishing @sikkerkey/cli-$platform"
+            (cd "npm/$platform" && npm publish --access public)
+          done
+
+      - name: Publish wrapper package
+        run: cd npm && npm publish --access public

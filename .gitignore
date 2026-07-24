@@ -1,0 +1,33 @@
+# Release tooling (local only)
+push.sh
+npm/publish.sh
+
+# Compiled binaries. Named explicitly rather than as a bare "sikkerkey"
+# pattern, which would also swallow npm/bin/sikkerkey — the Node launcher
+# script the wrapper package declares as its entry point.
+/sikkerkey
+/sikkerkey.exe
+/npm/linux-x64/sikkerkey
+/npm/linux-arm64/sikkerkey
+/npm/darwin-x64/sikkerkey
+/npm/darwin-arm64/sikkerkey
+/npm/win32-x64/sikkerkey.exe
+dist/
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+*.test
