@@ -1,6 +1,6 @@
 {
   "name": "@sikkerkey/cli-darwin-x64",
-  "version": "3.0.7",
+  "version": "4.0.0",
   "description": "SikkerKey CLI — macOS x64 binary",
   "license": "MIT",
   "os": [

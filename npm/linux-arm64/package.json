@@ -1,6 +1,6 @@
 {
   "name": "@sikkerkey/cli-linux-arm64",
-  "version": "3.0.7",
+  "version": "4.0.0",
   "description": "SikkerKey CLI — Linux arm64 binary",
   "license": "MIT",
   "os": [
