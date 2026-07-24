@@ -3,6 +3,12 @@
   "version": "4.0.0",
   "description": "SikkerKey CLI — Linux x64 binary",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SikkerKeyOfficial/sikkerkey-cli.git",
+    "directory": "npm/linux-x64"
+  },
+  "homepage": "https://sikkerkey.com",
   "os": [
     "linux"
   ],

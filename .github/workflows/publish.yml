@@ -44,6 +44,31 @@ jobs:
           GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o npm/darwin-arm64/sikkerkey  main.go
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o npm/win32-x64/sikkerkey.exe main.go
 
+      - name: Verify provenance metadata
+        run: |
+          # npm validates every package's repository.url against the repo the
+          # build came from and rejects the publish if they disagree. A package
+          # missing the field fails mid-publish, after earlier packages are
+          # already live, so check all six up front.
+          node -e '
+            const fs = require("fs");
+            const expected = "https://github.com/${{ github.repository }}";
+            const files = ["npm/package.json", "npm/linux-x64/package.json",
+              "npm/linux-arm64/package.json", "npm/darwin-x64/package.json",
+              "npm/darwin-arm64/package.json", "npm/win32-x64/package.json"];
+            let bad = 0;
+            for (const f of files) {
+              const raw = (JSON.parse(fs.readFileSync(f)).repository || {}).url || "";
+              const norm = raw.replace(/^git\+/, "").replace(/\.git$/, "");
+              if (norm !== expected) {
+                console.error(`${f}: repository.url is "${raw}", expected to normalize to ${expected}`);
+                bad++;
+              }
+            }
+            if (bad) process.exit(1);
+            console.log(`All ${files.length} manifests declare ${expected}`);
+          '
+
       - name: Verify tarballs carry the binaries
         run: |
           # The binaries are gitignored, so a stray ignore rule reaching into a
