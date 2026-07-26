@@ -19,6 +19,7 @@ import (
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/cache"
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/client"
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/config"
+	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/sshcert"
 )
 
 // version is set at build time via `-ldflags="-X main.version=<vX.Y.Z>"`.
@@ -69,6 +70,8 @@ func main() {
 		cmdRename(os.Args[2:])
 	case "get":
 		cmdGet(os.Args[2:])
+	case "certificate":
+		cmdCertificate(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
 	case "run":
@@ -114,6 +117,7 @@ Config:
 
 Secrets:
   get            Fetch a secret value or field
+  certificate    Get a certificate and load it for use
 
 Operations:
   export         Export secrets in env, json, yaml, or dotenv format
@@ -176,6 +180,28 @@ adding --offline to get, run, or export:
   sikkerkey export --offline
 
 Off by default. When disabled, reads never touch the cache.`,
+
+	"certificate": `Usage:
+  sikkerkey certificate <secret_id>
+  sikkerkey certificate <secret_id> --validity 15m
+
+Requests a certificate from a certificate secret and loads it into your
+ssh-agent, then prints the connection to use:
+
+  $ sikkerkey certificate sk_a1b2c3d4
+  Loaded certificate for deploy, valid 1h0m
+  ssh deploy@prod-box.example.com
+
+A keypair is generated on this machine for each request and only the
+public half is sent. Where no ssh-agent is running, the key and
+certificate are written to ~/.sikkerkey/certificates/ instead and the
+ssh command names the key with -i.
+
+Options:
+      --validity <dur>    request a shorter certificate, e.g. 15m or 2h
+                          (the credential's configured maximum is the cap)
+
+Exit code 0 on success, 1 on error.`,
 
 	"get": `Usage:
   sikkerkey get <secret_id>
@@ -494,6 +520,96 @@ func cmdRename(args []string) {
 }
 
 // sikkerkey get <secret_id> [field] [-o format]
+// cmdCertificate requests a certificate and puts it where ssh will find it.
+//
+// The keypair is generated per request and its private half never leaves this
+// process except into the local ssh-agent, so SikkerKey signs a public key it is
+// handed rather than issuing anyone a private key.
+func cmdCertificate(args []string) {
+	usage := "usage: sikkerkey certificate <secret_id> [--validity <duration>]"
+
+	var secretID string
+	var validitySeconds int64
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--validity" && i+1 < len(args):
+			i++
+			d, err := time.ParseDuration(args[i])
+			if err != nil || d <= 0 {
+				fmt.Fprintf(os.Stderr, "error: invalid duration '%s'. Use e.g. 15m or 2h\n", args[i])
+				os.Exit(1)
+			}
+			validitySeconds = int64(d.Seconds())
+		case strings.HasPrefix(args[i], "-"):
+			fmt.Fprintf(os.Stderr, "error: unknown option '%s'\n%s\n", args[i], usage)
+			os.Exit(1)
+		case secretID == "":
+			secretID = args[i]
+		default:
+			fmt.Fprintln(os.Stderr, usage)
+			os.Exit(1)
+		}
+	}
+	if secretID == "" {
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(1)
+	}
+
+	subject, err := sshcert.NewSubject()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+
+	profile := loadProfileFromIdentity()
+	c := newClient(profile)
+	cert, err := c.GetCertificate(secretID, subject.PublicKeyLine, validitySeconds)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	// Certificates are unrecallable once signed, so a type this build cannot
+	// install must not be written somewhere and called done.
+	if cert.CertificateType != "ssh" {
+		fmt.Fprintf(os.Stderr, "error: this SikkerKey CLI cannot install '%s' certificates. Update the CLI.\n", cert.CertificateType)
+		os.Exit(1)
+	}
+
+	installed, err := sshcert.Install(subject, cert.Certificate, "sikkerkey-"+secretID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+
+	username := cert.Fields["username"]
+	host := cert.Fields["host"]
+	remaining := time.Duration(cert.ValidBefore-time.Now().Unix()) * time.Second
+
+	fmt.Printf("Loaded certificate for %s, valid %s\n", username, fmtRemaining(remaining))
+	target := username + "@" + host
+	if host == "" {
+		target = username + "@<host>"
+	}
+	if installed.InAgent {
+		fmt.Printf("ssh %s\n", target)
+	} else {
+		fmt.Printf("ssh -i %s %s\n", installed.KeyPath, target)
+	}
+}
+
+// fmtRemaining renders a validity the way a person reads it, e.g. "1h0m".
+func fmtRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "0m"
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
+}
+
 func cmdGet(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: sikkerkey get <secret_id> [field] [-o json|plain]")
@@ -1222,14 +1338,40 @@ func cmdListSecrets() {
 		for _, proj := range projOrder[key] {
 			fmt.Printf("  [%s]\n", proj)
 			for _, s := range byAppProj[key][proj] {
-				if s.FieldNames != nil && *s.FieldNames != "" {
-					fmt.Printf("    %s  %s  [structured]\n", s.ID, s.Name)
+				if tag := secretKindTag(s); tag != "" {
+					fmt.Printf("    %s  %s  %s\n", s.ID, s.Name, tag)
 				} else {
 					fmt.Printf("    %s  %s\n", s.ID, s.Name)
 				}
 			}
 		}
 	}
+}
+
+// secretKindTag labels a secret in list output, or returns "" for a plain one.
+//
+// Driven by the server's type where it sends one. The fieldNames fallback below
+// is for a service older than that field: it can only ever say "structured",
+// which is why leased and certificate secrets used to be labelled that way.
+func secretKindTag(s client.CliSecretListItem) string {
+	switch s.Type {
+	case "certificate":
+		return "[certificate]"
+	case "leased-secret":
+		return "[leased]"
+	case "structured":
+		return "[structured]"
+	case "managed":
+		return "[managed]"
+	case "canary":
+		return "[canary]"
+	case "secret":
+		return ""
+	}
+	if s.FieldNames != nil && *s.FieldNames != "" && *s.FieldNames != "[]" {
+		return "[structured]"
+	}
+	return ""
 }
 
 func cmdListVaults() {
@@ -1606,7 +1748,7 @@ func cmdCompletion(args []string) {
 	}
 
 	commands := []string{
-		"connect", "unlock", "rename", "project", "get", "export", "run",
+		"connect", "unlock", "rename", "project", "get", "certificate", "export", "run",
 		"list", "delete", "agent", "whoami", "status", "cache",
 		"clear", "completion", "version", "help",
 	}

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -148,6 +149,9 @@ type CliSecretListItem struct {
 	ProjectName     string  `json:"projectName"`
 	ApplicationID   string  `json:"applicationId"`
 	ApplicationName string  `json:"applicationName"`
+	// The secret's kind. Empty from a service that predates the field, which is
+	// why display falls back to the fieldNames guess rather than showing nothing.
+	Type string `json:"type"`
 }
 
 // CliSecretListResponse is the JSON body from GET /v1/cli/secrets.
@@ -495,6 +499,82 @@ func (c *Client) GetSecret(secretID string) (string, error) {
 	}
 
 	return secret.Value, nil
+}
+
+// CertificateResponse is the JSON body returned by GET /v1/secret/{id} when the
+// secret issues certificates. Fields carries whatever the certificate type needs
+// alongside the certificate itself — for SSH, the username to log in as.
+type CertificateResponse struct {
+	Certificate     string            `json:"certificate"`
+	CertificateType string            `json:"certificateType"`
+	Fields          map[string]string `json:"fields"`
+	ValidAfter      int64             `json:"validAfter"`
+	ValidBefore     int64             `json:"validBefore"`
+}
+
+// GetCertificate signs subjectPublicKey under the certificate secret's authority.
+//
+// The private half of that key never leaves the caller, which is what keeps this
+// a signing request rather than a credential fetch.
+//
+// validitySeconds is a request for a SHORTER certificate; the server clamps it to
+// the credential's configured maximum. It rides in the query string, which is
+// outside the signed payload (the signature covers method:path only), so it can
+// never be tampered into a LONGER certificate than the configuration allows.
+func (c *Client) GetCertificate(secretID, subjectPublicKey string, validitySeconds int64) (*CertificateResponse, error) {
+	path := "/v1/secret/" + secretID
+	url := c.baseURL + path
+	if validitySeconds > 0 {
+		url += "?validity=" + strconv.FormatInt(validitySeconds, 10)
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	headers := c.signer.Headers("GET", path, []byte{})
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("X-SikkerKey-Subject-Key", subjectPublicKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, transportError(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, transportError(err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, newAPIError(resp.StatusCode, body)
+	}
+
+	var out CertificateResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	if out.Certificate == "" {
+		// Every secret type answers this same endpoint, so what came back instead
+		// says which of two different things went wrong.
+		var plain SecretResponse
+		if json.Unmarshal(body, &plain) == nil && plain.Value != "" {
+			// A certificate secret stores "{}" as its value and never serves it;
+			// the signed certificate is produced at read time. Receiving the
+			// placeholder means the read never reached the certificate path, so
+			// the service answering is older than certificate support.
+			if strings.TrimSpace(plain.Value) == "{}" {
+				return nil, fmt.Errorf("the SikkerKey service serving this secret does not support certificates yet")
+			}
+			return nil, fmt.Errorf("%s is not a certificate secret. Use 'sikkerkey get %s' to read it", secretID, secretID)
+		}
+		return nil, fmt.Errorf("server returned no certificate")
+	}
+	return &out, nil
 }
 
 // SyncConfig is returned by GET /v1/secret/{id}/sync-config.
