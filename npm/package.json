@@ -1,6 +1,6 @@
 {
   "name": "sikkerkey",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "description": "SikkerKey CLI — secrets management with machine authentication",
   "keywords": ["secrets", "vault", "encryption", "cli", "sikkerkey"],
   "homepage": "https://sikkerkey.com",
@@ -17,10 +17,10 @@
   },
   "files": ["bin"],
   "optionalDependencies": {
-    "@sikkerkey/cli-linux-x64": "4.1.0",
-    "@sikkerkey/cli-linux-arm64": "4.1.0",
-    "@sikkerkey/cli-darwin-x64": "4.1.0",
-    "@sikkerkey/cli-darwin-arm64": "4.1.0",
-    "@sikkerkey/cli-win32-x64": "4.1.0"
+    "@sikkerkey/cli-linux-x64": "4.2.0",
+    "@sikkerkey/cli-linux-arm64": "4.2.0",
+    "@sikkerkey/cli-darwin-x64": "4.2.0",
+    "@sikkerkey/cli-darwin-arm64": "4.2.0",
+    "@sikkerkey/cli-win32-x64": "4.2.0"
   }
 }

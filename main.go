@@ -20,6 +20,7 @@ import (
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/client"
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/config"
 	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/sshcert"
+	"github.com/SikkerKeyOfficial/sikkerkey-cli/internal/x509cert"
 )
 
 // version is set at build time via `-ldflags="-X main.version=<vX.Y.Z>"`.
@@ -185,17 +186,27 @@ Off by default. When disabled, reads never touch the cache.`,
   sikkerkey certificate <secret_id>
   sikkerkey certificate <secret_id> --validity 15m
 
-Requests a certificate from a certificate secret and loads it into your
-ssh-agent, then prints the connection to use:
+Requests a certificate from a certificate secret. A keypair is generated on
+this machine for each request and only the public half is sent, so the
+private key never leaves the machine. The type is detected automatically.
+
+SSH certificates load into your ssh-agent and print the connection to use:
 
   $ sikkerkey certificate sk_a1b2c3d4
   Loaded certificate for deploy, valid 1h0m
   ssh deploy@prod-box.example.com
 
-A keypair is generated on this machine for each request and only the
-public half is sent. Where no ssh-agent is running, the key and
-certificate are written to ~/.sikkerkey/certificates/ instead and the
-ssh command names the key with -i.
+With no ssh-agent running, the key and certificate are written to
+~/.sikkerkey/certificates/ and the ssh command names the key with -i.
+
+X.509 certificates are written to ~/.sikkerkey/certificates/ as the leaf,
+its key, and the issuing CA chain, for a TLS client to load:
+
+  $ sikkerkey certificate sk_9f8e7d6c
+  Issued certificate for svc-payments, valid 1h0m
+    cert:  ~/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.crt
+    key:   ~/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.key
+    chain: ~/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.chain.pem
 
 Options:
       --validity <dur>    request a shorter certificate, e.g. 15m or 2h
@@ -483,7 +494,6 @@ func cmdConnect(args []string) {
 	}
 }
 
-
 func cmdRename(args []string) {
 	if len(args) < 3 {
 		printCommandHelp("rename")
@@ -555,26 +565,46 @@ func cmdCertificate(args []string) {
 		os.Exit(1)
 	}
 
-	subject, err := sshcert.NewSubject()
+	profile := loadProfileFromIdentity()
+	c := newClient(profile)
+
+	// Generate a subject key for each certificate type up front and send both; the
+	// server signs the one its authority calls for and names the type in the
+	// response. This avoids a describe round trip and any query string, which a
+	// signed route rejects.
+	sshSubject, err := sshcert.NewSubject()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+	x509Subject, err := x509cert.NewSubject()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
 
-	profile := loadProfileFromIdentity()
-	c := newClient(profile)
-	cert, err := c.GetCertificate(secretID, subject.PublicKeyLine, validitySeconds)
+	cert, err := c.GetCertificate(secretID, sshSubject.PublicKeyLine, x509Subject.PublicKey, validitySeconds)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)
 	}
-	// Certificates are unrecallable once signed, so a type this build cannot
-	// install must not be written somewhere and called done.
-	if cert.CertificateType != "ssh" {
+
+	switch cert.CertificateType {
+	case "ssh":
+		installSSHCertificate(sshSubject, cert, secretID)
+	case "x509":
+		installX509Certificate(x509Subject, cert, secretID)
+	default:
+		// Certificates are unrecallable once signed, so a type this build cannot
+		// install must not be written somewhere and called done.
 		fmt.Fprintf(os.Stderr, "error: this SikkerKey CLI cannot install '%s' certificates. Update the CLI.\n", cert.CertificateType)
 		os.Exit(1)
 	}
+}
 
+// installSSHCertificate loads a signed SSH certificate into the agent and prints
+// the ssh command to use.
+func installSSHCertificate(subject *sshcert.Subject, cert *client.CertificateResponse, secretID string) {
 	installed, err := sshcert.Install(subject, cert.Certificate, "sikkerkey-"+secretID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -594,6 +624,29 @@ func cmdCertificate(args []string) {
 		fmt.Printf("ssh %s\n", target)
 	} else {
 		fmt.Printf("ssh -i %s %s\n", installed.KeyPath, target)
+	}
+}
+
+// installX509Certificate writes a signed X.509 certificate, its key, and the
+// issuing CA chain where a TLS client can load them.
+func installX509Certificate(subject *x509cert.Subject, cert *client.CertificateResponse, secretID string) {
+	installed, err := x509cert.Install(subject, cert.Certificate, cert.Fields["chain"], "sikkerkey-"+secretID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+
+	name := cert.Fields["commonName"]
+	if name == "" {
+		name = secretID
+	}
+	remaining := time.Duration(cert.ValidBefore-time.Now().Unix()) * time.Second
+
+	fmt.Printf("Issued certificate for %s, valid %s\n", name, fmtRemaining(remaining))
+	fmt.Printf("  cert:  %s\n", installed.CertPath)
+	fmt.Printf("  key:   %s\n", installed.KeyPath)
+	if installed.ChainPath != "" {
+		fmt.Printf("  chain: %s\n", installed.ChainPath)
 	}
 }
 
@@ -738,40 +791,84 @@ func cmdAgent(args []string) {
 		for i := 0; i < len(remaining); i++ {
 			switch remaining[i] {
 			case "--secret":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --secret requires a value"); os.Exit(1) }
-				i++; secretID = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --secret requires a value")
+					os.Exit(1)
+				}
+				i++
+				secretID = remaining[i]
 			case "--provider":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --provider requires a value"); os.Exit(1) }
-				i++; providerType = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --provider requires a value")
+					os.Exit(1)
+				}
+				i++
+				providerType = remaining[i]
 			case "--host":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --host requires a value"); os.Exit(1) }
-				i++; host = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --host requires a value")
+					os.Exit(1)
+				}
+				i++
+				host = remaining[i]
 			case "--port":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --port requires a value"); os.Exit(1) }
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --port requires a value")
+					os.Exit(1)
+				}
 				i++
 				p, err := strconv.Atoi(remaining[i])
-				if err != nil { fmt.Fprintln(os.Stderr, "error: --port must be a number"); os.Exit(1) }
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "error: --port must be a number")
+					os.Exit(1)
+				}
 				port = p
 			case "--database":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --database requires a value"); os.Exit(1) }
-				i++; database = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --database requires a value")
+					os.Exit(1)
+				}
+				i++
+				database = remaining[i]
 			case "--admin-user":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --admin-user requires a value"); os.Exit(1) }
-				i++; adminUser = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --admin-user requires a value")
+					os.Exit(1)
+				}
+				i++
+				adminUser = remaining[i]
 			case "--admin-pass":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --admin-pass requires a value"); os.Exit(1) }
-				i++; adminPass = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --admin-pass requires a value")
+					os.Exit(1)
+				}
+				i++
+				adminPass = remaining[i]
 			case "--username-field":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --username-field requires a value"); os.Exit(1) }
-				i++; usernameField = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --username-field requires a value")
+					os.Exit(1)
+				}
+				i++
+				usernameField = remaining[i]
 			case "--password-field":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --password-field requires a value"); os.Exit(1) }
-				i++; passwordField = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --password-field requires a value")
+					os.Exit(1)
+				}
+				i++
+				passwordField = remaining[i]
 			case "--poll-interval":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --poll-interval requires a value"); os.Exit(1) }
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --poll-interval requires a value")
+					os.Exit(1)
+				}
 				i++
 				p, err := strconv.Atoi(remaining[i])
-				if err != nil { fmt.Fprintln(os.Stderr, "error: --poll-interval must be a number"); os.Exit(1) }
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "error: --poll-interval must be a number")
+					os.Exit(1)
+				}
 				pollInterval = p
 			}
 		}
@@ -835,8 +932,12 @@ func cmdAgent(args []string) {
 		for i := 0; i < len(remaining); i++ {
 			switch remaining[i] {
 			case "--secret":
-				if i+1 >= len(remaining) { fmt.Fprintln(os.Stderr, "error: --secret requires a value"); os.Exit(1) }
-				i++; secretID = remaining[i]
+				if i+1 >= len(remaining) {
+					fmt.Fprintln(os.Stderr, "error: --secret requires a value")
+					os.Exit(1)
+				}
+				i++
+				secretID = remaining[i]
 			case "--now":
 				installNow = true
 			}
@@ -872,7 +973,8 @@ func cmdAgent(args []string) {
 		var secretID string
 		for i := 0; i < len(remaining); i++ {
 			if remaining[i] == "--secret" && i+1 < len(remaining) {
-				i++; secretID = remaining[i]
+				i++
+				secretID = remaining[i]
 			}
 		}
 		if secretID == "" {
@@ -888,7 +990,8 @@ func cmdAgent(args []string) {
 		var secretID string
 		for i := 0; i < len(remaining); i++ {
 			if remaining[i] == "--secret" && i+1 < len(remaining) {
-				i++; secretID = remaining[i]
+				i++
+				secretID = remaining[i]
 			}
 		}
 		if secretID == "" {
@@ -902,7 +1005,8 @@ func cmdAgent(args []string) {
 		var secretID string
 		for i := 0; i < len(remaining); i++ {
 			if remaining[i] == "--secret" && i+1 < len(remaining) {
-				i++; secretID = remaining[i]
+				i++
+				secretID = remaining[i]
 			}
 		}
 		if secretID == "" {
@@ -954,14 +1058,26 @@ func cmdRun(args []string) {
 		}
 		switch args[i] {
 		case "--prefix":
-			if i+1 >= len(args) { fmt.Fprintln(os.Stderr, "error: --prefix requires a value"); os.Exit(1) }
-			i++; prefix = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --prefix requires a value")
+				os.Exit(1)
+			}
+			i++
+			prefix = args[i]
 		case "--project":
-			if i+1 >= len(args) { fmt.Fprintln(os.Stderr, "error: --project requires a value"); os.Exit(1) }
-			i++; projectFlag = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --project requires a value")
+				os.Exit(1)
+			}
+			i++
+			projectFlag = args[i]
 		case "--secret":
-			if i+1 >= len(args) { fmt.Fprintln(os.Stderr, "error: --secret requires a value"); os.Exit(1) }
-			i++; secretIDs = append(secretIDs, args[i])
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --secret requires a value")
+				os.Exit(1)
+			}
+			i++
+			secretIDs = append(secretIDs, args[i])
 		case "--all":
 			allSecrets = true
 		case "--watch":
@@ -1657,11 +1773,19 @@ func cmdExport(args []string) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--format":
-			if i+1 >= len(args) { fmt.Fprintln(os.Stderr, "error: --format requires a value"); os.Exit(1) }
-			i++; format = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --format requires a value")
+				os.Exit(1)
+			}
+			i++
+			format = args[i]
 		case "--project":
-			if i+1 >= len(args) { fmt.Fprintln(os.Stderr, "error: --project requires a value"); os.Exit(1) }
-			i++; projectFlag = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --project requires a value")
+				os.Exit(1)
+			}
+			i++
+			projectFlag = args[i]
 		case "--offline":
 			offline = true
 		}
@@ -1896,9 +2020,9 @@ func cmdStatus() {
 
 // resolveConfiguredVault returns the vault id to use for the current
 // command, in priority order:
-//   1. SIKKERKEY_VAULT env var (alias-resolvable)
-//   2. global default vault from cli_global.json
-//   3. single bootstrapped vault on disk
+//  1. SIKKERKEY_VAULT env var (alias-resolvable)
+//  2. global default vault from cli_global.json
+//  3. single bootstrapped vault on disk
 //
 // Returns empty string when nothing is connected and no vault exists
 // to fall back to. Exits when multiple vaults exist and none has been

@@ -62,7 +62,7 @@ sikkerkey list vaults        # bootstrapped vaults on this machine
 
 Each secret is listed with its kind, so `[certificate]`, `[leased]`, `[structured]`, `[managed]` and `[canary]` are distinguishable at a glance.
 
-### 4. Get a certificate
+### 4. Get an SSH or X.509 certificate
 
 ```bash
 sikkerkey certificate <secret-id>
@@ -76,7 +76,18 @@ Loaded certificate for deploy, valid 1h0m
 ssh deploy@prod-box.example.com
 ```
 
-A keypair is generated on this machine for each request and only the public half is sent. The signed certificate is loaded into your ssh-agent with a lifetime matching its own validity, so `ssh <user>@<host>` works with no further arguments and the key is dropped when the certificate expires. Where no ssh-agent is reachable, the key and certificate are written to `~/.sikkerkey/certificates/` and the printed command names the key with `-i`.
+The certificate authority selected for the secret determines its type automatically. SSH certificates are loaded into your ssh-agent with a lifetime matching their validity; where no agent is reachable, the CLI writes the key and certificate to `~/.sikkerkey/certificates/` and prints an `ssh -i` command.
+
+For an X.509 certificate, the output instead names three PEM files for your TLS client or server:
+
+```text
+Issued certificate for svc-payments, valid 1h0m
+  cert:  /home/alice/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.crt
+  key:   /home/alice/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.key
+  chain: /home/alice/.sikkerkey/certificates/sikkerkey-sk_9f8e7d6c.chain.pem
+```
+
+For both types, a fresh keypair is generated locally for every request and only its public half is sent to SikkerKey.
 
 ### 5. Scope commands to an application (optional)
 
@@ -137,7 +148,7 @@ Specify which secrets to inject with `--secret` or `--all`. With `--all` and no 
 | Command | Description |
 |---------|-------------|
 | `get <id> [field] [-o json]` | Read a secret value or field |
-| `certificate <id> [--validity <dur>]` | Get a certificate and load it for use |
+| `certificate <id> [--validity <dur>]` | Issue an SSH or X.509 certificate and install it locally |
 
 ### Operations
 
@@ -179,7 +190,37 @@ After bootstrapping, the machine must be approved in the SikkerKey dashboard bef
 
 ## Certificates
 
-`sikkerkey certificate` asks SikkerKey to sign a public key this machine just generated. The private half is created in memory for that request and handed only to the local ssh-agent, so the signing service issues certificates rather than keys. Certificate generation and installation are in [`internal/sshcert`](internal/sshcert).
+SikkerKey supports SSH and X.509/TLS certificates through the same command:
+
+```bash
+sikkerkey certificate <secret-id>
+sikkerkey certificate <secret-id> --validity 15m
+```
+
+The certificate authority attached to the secret determines which type is issued; there is no CLI type flag. Before issuing one, use the dashboard to:
+
+1. Create an SSH or **X.509 / TLS** authority under **Certificates** and install its public trust anchor on the systems that should accept it.
+2. Create a certificate secret in a project, select that authority, configure the identity and maximum validity, then grant the secret to the machine.
+
+For X.509 secrets, the dashboard configures a common name and/or subject alternative names (DNS names, IP addresses, or URIs), the extended key usage (`clientAuth`, `serverAuth`, or both), and an optional organization. Those configured values become the leaf identity; the requesting machine cannot choose different names. The dashboard's X.509 install command adds the CA to the Debian/Ubuntu system trust store. A TLS server verifying client certificates will commonly need its service configuration pointed directly at that CA file instead.
+
+Each request generates a new keypair on the requesting machine. Only the public key is signed by SikkerKey, so the private key never crosses the network. The normal machine authentication, project membership, secret grant, and access-policy checks still apply. `--validity` may request a shorter lifetime, but cannot exceed the secret's dashboard-configured maximum or the service-wide 24-hour ceiling.
+
+SSH certificates are loaded into the local ssh-agent when possible and removed by the agent when they expire. Without a reachable agent, the CLI writes an OpenSSH key and certificate under `~/.sikkerkey/certificates/`.
+
+X.509 certificates are always written under `~/.sikkerkey/certificates/`:
+
+| File | Contents |
+|------|----------|
+| `sikkerkey-<secret-id>.crt` | Signed leaf certificate (PEM) |
+| `sikkerkey-<secret-id>.key` | Locally generated P-256 private key (unencrypted PKCS#8 PEM, mode `0600`) |
+| `sikkerkey-<secret-id>.chain.pem` | Issuing CA certificate (PEM) |
+
+Point the TLS client or server at the leaf and key paths, and use the chain where its TLS configuration requires the issuing CA. Issuing the same secret again creates a new keypair and replaces these files, so a long-running process must reload them before the previous certificate expires.
+
+Certificates cannot be recalled after they are signed. Disabling or deleting a certificate secret stops new issuance. Deleting an authority also removes its dependent certificate secrets, but certificates already issued from it remain valid until they expire unless the authority's trust anchor is removed from the accepting systems.
+
+Certificate generation and installation are implemented in [`internal/sshcert`](internal/sshcert) and [`internal/x509cert`](internal/x509cert).
 
 ## Offline Cache
 
@@ -193,7 +234,7 @@ After bootstrapping, the machine must be approved in the SikkerKey dashboard bef
 | macOS | x64, arm64 (Apple Silicon) |
 | Windows | x64 |
 
-On Windows the ssh-agent is a named pipe, so `sikkerkey certificate` writes the key and certificate to `~/.sikkerkey/certificates/` there.
+On Windows the ssh-agent is a named pipe, so SSH certificates fall back to files under `~/.sikkerkey/certificates/`. X.509 certificates use that directory on every platform.
 
 ## Documentation
 

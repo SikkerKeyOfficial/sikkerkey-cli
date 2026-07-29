@@ -512,21 +512,19 @@ type CertificateResponse struct {
 	ValidBefore     int64             `json:"validBefore"`
 }
 
-// GetCertificate signs subjectPublicKey under the certificate secret's authority.
+// GetCertificate signs a subject public key under the certificate secret's
+// authority. It sends one subject key per certificate type — an SSH public key
+// line and an X.509 SubjectPublicKeyInfo as base64 DER — and the server signs the
+// one its authority calls for, naming the type in the response.
 //
-// The private half of that key never leaves the caller, which is what keeps this
-// a signing request rather than a credential fetch.
-//
-// validitySeconds is a request for a SHORTER certificate; the server clamps it to
-// the credential's configured maximum. It rides in the query string, which is
-// outside the signed payload (the signature covers method:path only), so it can
-// never be tampered into a LONGER certificate than the configuration allows.
-func (c *Client) GetCertificate(secretID, subjectPublicKey string, validitySeconds int64) (*CertificateResponse, error) {
+// The private halves never leave the caller, which is what keeps this a signing
+// request rather than a credential fetch. Everything rides in headers, never a
+// query string (rejected on signed routes): validitySeconds requests a SHORTER
+// certificate that the server clamps to the configured maximum, so it can never be
+// tampered into a longer one.
+func (c *Client) GetCertificate(secretID, sshSubjectKey, x509SubjectKey string, validitySeconds int64) (*CertificateResponse, error) {
 	path := "/v1/secret/" + secretID
 	url := c.baseURL + path
-	if validitySeconds > 0 {
-		url += "?validity=" + strconv.FormatInt(validitySeconds, 10)
-	}
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -537,7 +535,11 @@ func (c *Client) GetCertificate(secretID, subjectPublicKey string, validitySecon
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("X-SikkerKey-Subject-Key", subjectPublicKey)
+	req.Header.Set("X-SikkerKey-Subject-Key", sshSubjectKey)
+	req.Header.Set("X-SikkerKey-Subject-Key-X509", x509SubjectKey)
+	if validitySeconds > 0 {
+		req.Header.Set("X-SikkerKey-Validity", strconv.FormatInt(validitySeconds, 10))
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
